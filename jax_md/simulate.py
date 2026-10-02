@@ -2060,13 +2060,17 @@ def temp_csvr(
       """For an odd number of noise terms, sum two terms: one from the
       gamma-distributed generator and another from the square of a
       Gaussian-distributed random number."""
-      rr = random.normal(key, dtype=_dtype)
-      return 2.0 * random.gamma(key, (dof - 1) // 2, dtype=_dtype) + (rr * rr)
+      gamma_key, normal_key = random.split(key)
+      rr = random.normal(normal_key, dtype=_dtype)
+      return (
+        2.0 * random.gamma(gamma_key, (dof - 1) // 2, dtype=_dtype)
+        + (rr * rr)
+      )
 
   def csvr_update(state, tau, kT, dt):
     """Update the momentum by an scaling factor as described by
     Eq.A7 Bussi et al. [#bussi2007]_"""
-    key, split = random.split(state.rng)
+    key, r1_key, r2_key = random.split(state.rng, 3)
     dof = quantity.count_dof(state.position)
 
     _kT = temperature(state)
@@ -2074,8 +2078,8 @@ def temp_csvr(
     KE_old = dof * _kT / 2
     KE_new = dof * kT / 2
 
-    r1 = random.normal(key, dtype=state.position.dtype)
-    r2 = sum_noises(state, key)
+    r1 = random.normal(r1_key, dtype=state.position.dtype)
+    r2 = sum_noises(state, r2_key)
 
     c1 = jnp.exp(-dt / tau)
     c2 = (1 - c1) * KE_new / KE_old / dof
