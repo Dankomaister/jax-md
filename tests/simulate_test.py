@@ -15,6 +15,7 @@
 """Tests for google3.third_party.py.jax_md.simulate."""
 
 import functools
+from unittest.mock import patch
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -63,6 +64,67 @@ if util.x64_enabled():
 
 ke_fn = lambda p, m: quantity.kinetic_energy(momentum=p, mass=m)
 kT_fn = lambda p, m: quantity.temperature(momentum=p, mass=m)
+
+
+# Adapted from the original sequential recurrence in jax_md/simulate.py.
+# This oracle shares state types and SY weights, but no optimized update code.
+def _nose_hoover_reference_substep(delta, momentum, chain, kT):
+  """Original sequential array recurrence, independent of scan lowering."""
+  xi, p, q, tau, ke, dof = dataclasses.astuple(chain)
+  d2 = delta / np.float32(2)
+  d4, d8 = d2 / np.float32(2), d2 / np.float32(4)
+  last = p.shape[0] - 1
+  g = p[last - 1] ** np.float32(2) / q[last - 1] - kT
+  p = p.at[last].add(d4 * g)
+  for m in range(last - 1, 0, -1):
+    g = p[m - 1] ** 2 / q[m - 1] - kT
+    scale = np.exp(-d8 * p[m + 1] / q[m + 1])
+    p = p.at[m].set(scale * (scale * p[m] + d4 * g))
+  # Baseline length 1 clamps index 1; it has no special one-chain algorithm.
+  neighbor = min(1, last)
+  g = np.float32(2) * ke - dof * kT
+  scale = np.exp(-d8 * p[neighbor] / q[neighbor])
+  p = p.at[0].set(scale * (scale * p[0] + d4 * g))
+  scale = np.exp(-d2 * p[0] / q[0])
+  ke = ke * scale ** np.float32(2)
+  momentum = jax.tree.map(lambda x: x * scale, momentum)
+  xi = xi + d2 * p / q
+  g = np.float32(2) * ke - dof * kT
+  for m in range(last):
+    scale = np.exp(-d8 * p[m + 1] / q[m + 1])
+    update = scale * (scale * p[m] + d4 * g)
+    p = p.at[m].set(update)
+    g = update ** 2 / q[m] - kT
+  p = p.at[last].add(d4 * g)
+  return momentum, simulate.NoseHooverChain(xi, p, q, tau, ke, dof), kT
+
+
+def _nose_hoover_reference(dt, chain_length, chain_steps, sy_steps, tau):
+  # Keep initialization and mass updates independent of the optimized helper.
+  def initialize(degrees_of_freedom, KE, kT):
+    xi = np.zeros(chain_length, KE.dtype)
+    p_xi = np.zeros(chain_length, KE.dtype)
+    Q = kT * tau ** np.float32(2) * np.ones(chain_length, dtype=np.float32)
+    Q = Q.at[0].multiply(degrees_of_freedom)
+    return simulate.NoseHooverChain(xi, p_xi, Q, tau, KE, degrees_of_freedom)
+
+  def update_mass(state, kT):
+    Q = kT * state.tau ** np.float32(2) * np.ones(chain_length, dtype=np.float32)
+    Q = Q.at[0].multiply(state.degrees_of_freedom)
+    return state.set(mass=Q)
+
+  def half_step(p, chain, kT):
+    if chain_steps == 1 and sy_steps == 1:
+      p, chain, _ = _nose_hoover_reference_substep(dt, p, chain, kT)
+      return p, chain
+    weights = np.array(simulate.SUZUKI_YOSHIDA_WEIGHTS[sy_steps])
+    for _ in range(chain_steps):
+      for i in range(sy_steps):
+        delta = np.float32((dt / chain_steps) * weights[i])
+        p, chain, _ = _nose_hoover_reference_substep(delta, p, chain, kT)
+    return p, chain
+
+  return simulate.NoseHooverChainFns(initialize, half_step, update_mass)
 
 
 # pylint: disable=invalid-name
@@ -246,6 +308,173 @@ class SimulateTest(test_util.JAXMDTestCase):
     assert state.position.dtype == dtype
     self.assertAllClose(
       state.position, exact_state.position, atol=tol, rtol=tol
+    )
+
+  def _assert_nose_hoover_state_close(self, actual, expected, dtype):
+    # Tree structure includes static degrees_of_freedom; leaves include KE,
+    # chain masses, tau, positions and momenta, including scalar barostat state.
+    self.assertEqual(jax.tree.structure(actual), jax.tree.structure(expected))
+    atol, rtol = (2e-10, 2e-9) if dtype == f64 else (2e-6, 2e-5)
+    for x, y in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+      self.assertEqual(np.shape(x), np.shape(y))
+      self.assertEqual(np.asarray(x).dtype, np.asarray(y).dtype)
+      self.assertAllClose(x, y, atol=atol, rtol=rtol)
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      {
+        'testcase_name': (
+          f'_length={length}_steps={steps}_sy={sy}_dtype={dtype.__name__}'
+        ),
+        'length': length,
+        'steps': steps,
+        'sy': sy,
+        'dtype': dtype,
+      }
+      # Direct path, all SY orders, scalar/scan and 14/16-stage boundaries.
+      for length, steps, sy in [
+        (1, 1, 1),
+        (1, 2, 7),
+        (4, 1, 1),
+        (4, 4, 7),
+        (5, 2, 3),
+        (5, 2, 7),
+        (6, 1, 5),
+        (8, 2, 7),
+        (8, 16, 1),
+        (9, 2, 7),
+        (9, 16, 1),
+      ]
+      for dtype in DTYPE
+    )
+  )
+  def test_nose_hoover_chain_recurrence(self, length, steps, sy, dtype):
+    dt, kT = dtype(0.01), dtype(1)
+    actual = simulate.nose_hoover_chain(dt, length, steps, sy, dtype(1))
+    reference = _nose_hoover_reference(dt, length, steps, sy, dtype(1))
+    # Scalar momentum exercises the NPT barostat's form of the shared helper.
+    p = (
+      dtype(0.7)
+      if (length, sy) in [(1, 7), (4, 1)]
+      else np.arange(12, dtype=dtype).reshape(4, 3) * dtype(0.1)
+    )
+    initial = actual.initialize(np.size(p), np.sum(p * p) / 2, kT)
+    self._assert_nose_hoover_state_close(
+      initial, reference.initialize(np.size(p), np.sum(p * p) / 2, kT), dtype
+    )
+    chain = initial.set(
+      position=np.arange(length, dtype=dtype) * dtype(0.01) + dtype(0.02),
+      momentum=np.arange(length, dtype=dtype) * dtype(0.02) + dtype(0.03),
+    )
+
+    def run(factory, count, target):
+      state = (p, factory.update_mass(chain, target))
+      return lax.fori_loop(
+        0, count, lambda _, s: factory.half_step(*s, target), state
+      )
+
+    for count in [1, 5]:
+      self._assert_nose_hoover_state_close(
+        jit(partial(run, actual, count))(dtype(1.2)),
+        jit(partial(run, reference, count))(dtype(1.2)),
+        dtype,
+      )
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      {
+        'testcase_name': f'_{ensemble}_dtype={dtype.__name__}',
+        'ensemble': ensemble,
+        'dtype': dtype,
+      }
+      for ensemble in ['nvt', 'npt']
+      for dtype in DTYPE
+    )
+  )
+  def test_nose_hoover_integration_dynamic_temperature(self, ensemble, dtype):
+    r = np.arange(12, dtype=dtype).reshape(4, 3) * dtype(0.03)
+    mass = np.linspace(dtype(0.8), dtype(1.5), 4)
+    nhc = dict(chain_length=4, chain_steps=4, sy_steps=7, tau=dtype(1))
+    if ensemble == 'nvt':
+      _, shift = space.free()
+      energy_fn = lambda r, **kw: np.sum(r * r) / dtype(2)
+      factory = partial(
+        simulate.nvt_nose_hoover,
+        energy_fn,
+        shift,
+        dtype(0.001),
+        dtype(1),
+        **nhc,
+      )
+      init_args = ()
+    else:
+      box = np.eye(3, dtype=dtype) * dtype(4)
+      _, shift = space.periodic_general(
+        box, fractional_coordinates=False, wrapped=False
+      )
+
+      def energy_fn(r, box, perturbation=1.0, **kw):
+        return np.sum(r * r) * perturbation**2 / dtype(2)
+
+      factory = partial(
+        simulate.npt_nose_hoover,
+        energy_fn,
+        shift,
+        dtype(0.001),
+        dtype(0.1),
+        dtype(1),
+        thermostat_kwargs=nhc,
+        barostat_kwargs=nhc,
+      )
+      init_args = (box,)
+    init, step = factory()
+    # Substitute only the public factory while constructing the reference
+    # consumer; no private closure inspection or changes to production code.
+    with patch.object(simulate, 'nose_hoover_chain', _nose_hoover_reference):
+      ref_init, ref_step = factory()
+    state = init(random.PRNGKey(21), r, *init_args, mass=mass, momenta=r * 3)
+    self._assert_nose_hoover_state_close(
+      state,
+      ref_init(random.PRNGKey(21), r, *init_args, mass=mass, momenta=r * 3),
+      dtype,
+    )
+    if ensemble == 'npt':
+      state = state.set(
+        box_momentum=dtype(0.01),
+        barostat=state.barostat.set(
+          kinetic_energy=ke_fn(dtype(0.01), state.box_mass)
+        ),
+      )
+
+    def run(fn, count):
+      return jit(
+        lambda t: lax.fori_loop(0, count, lambda _, s: fn(s, kT=t), state)
+      )(dtype(1.2))
+
+    for count in [1, 5]:
+      self._assert_nose_hoover_state_close(
+        run(step, count), run(ref_step, count), dtype
+      )
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      {'testcase_name': f'_dtype={dtype.__name__}', 'dtype': dtype}
+      for dtype in DTYPE
+    )
+  )
+  def test_nose_hoover_temperature_gradient(self, dtype):
+    p = np.arange(12, dtype=dtype).reshape(4, 3) * dtype(0.1)
+
+    def objective(factory, target):
+      chain = factory.initialize(12, np.sum(p * p) / 2, target)
+      return np.sum(factory.half_step(p, chain, target)[0] ** 2)
+
+    actual = simulate.nose_hoover_chain(dtype(0.01), 4, 4, 7, dtype(1))
+    reference = _nose_hoover_reference(dtype(0.01), 4, 4, 7, dtype(1))
+    self._assert_nose_hoover_state_close(
+      jit(jax.grad(partial(objective, actual)))(dtype(1.2)),
+      jit(jax.grad(partial(objective, reference)))(dtype(1.2)),
+      dtype,
     )
 
   @parameterized.named_parameters(

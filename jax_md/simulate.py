@@ -433,6 +433,14 @@ def nose_hoover_chain(
     simulation, and update the chain masses respectively.
   """
 
+  # Scans bound compiler expansion for longer chains; their inner loops use
+  # two-way unrolling. Short chains avoid indexed array updates with scalars.
+  chain_unroll = 2
+  scalar_chain = chain_length <= 8
+  # Scalar positions avoid vector updates across repeated stage blocks.
+  # Shorter half-steps retain array positions to limit scalar expansion.
+  scalar_positions = chain_steps * sy_steps >= 16
+
   def init_fn(degrees_of_freedom, KE, kT):
     xi = jnp.zeros(chain_length, KE.dtype)
     p_xi = jnp.zeros(chain_length, KE.dtype)
@@ -441,18 +449,21 @@ def nose_hoover_chain(
     Q = Q.at[0].multiply(degrees_of_freedom)
     return NoseHooverChain(xi, p_xi, Q, tau, KE, degrees_of_freedom)
 
-  def substep_fn(delta, P, state, kT):
-    """Apply a single update to the chain parameters and rescales velocity."""
-    xi, p_xi, Q, _tau, KE, DOF = dataclasses.astuple(state)
-
+  def chain_substep_fn(delta, P, xi, p_xi, Q, KE, DOF, kT):
+    """Shared recurrence, with scalar momenta for short-chain internal carries."""
     delta_2 = delta / f32(2.0)
     delta_4 = delta_2 / f32(2.0)
     delta_8 = delta_4 / f32(2.0)
 
     M = chain_length - 1
+    if scalar_chain:
+      p_xi = list(p_xi)
 
     G = p_xi[M - 1] ** f32(2) / Q[M - 1] - kT
-    p_xi = p_xi.at[M].add(delta_4 * G)
+    if scalar_chain:
+      p_xi[M] = p_xi[M] + delta_4 * G
+    else:
+      p_xi = p_xi.at[M].add(delta_4 * G)
 
     def backward_loop_fn(p_xi_new, m):
       G = p_xi[m - 1] ** 2 / Q[m - 1] - kT
@@ -460,19 +471,38 @@ def nose_hoover_chain(
       p_xi_new = scale * (scale * p_xi[m] + delta_4 * G)
       return p_xi_new, p_xi_new
 
-    idx = jnp.arange(M - 1, 0, -1)
-    _, p_xi_update = lax.scan(backward_loop_fn, p_xi[M], idx, unroll=2)
-    p_xi = p_xi.at[idx].set(p_xi_update)
+    if scalar_chain:
+      p_xi_new = p_xi[M]
+      for m in range(M - 1, 0, -1):
+        p_xi_new, _ = backward_loop_fn(p_xi_new, m)
+        p_xi[m] = p_xi_new
+    else:
+      idx = jnp.arange(M - 1, 0, -1)
+      _, p_xi_update = lax.scan(
+        backward_loop_fn, p_xi[M], idx, unroll=chain_unroll
+      )
+      p_xi = p_xi.at[idx].set(p_xi_update)
 
     G = f32(2.0) * KE - DOF * kT
-    scale = jnp.exp(-delta_8 * p_xi[1] / Q[1])
-    p_xi = p_xi.at[0].set(scale * (scale * p_xi[0] + delta_4 * G))
+    # Preserve the original clipped neighbor indexing for length one.
+    neighbor = min(1, M)
+    scale = jnp.exp(-delta_8 * p_xi[neighbor] / Q[neighbor])
+    p_xi_0 = scale * (scale * p_xi[0] + delta_4 * G)
+    if scalar_chain:
+      p_xi[0] = p_xi_0
+    else:
+      p_xi = p_xi.at[0].set(p_xi_0)
 
     scale = jnp.exp(-delta_2 * p_xi[0] / Q[0])
     KE = KE * scale ** f32(2)
     P = tree_map(lambda p: p * scale, P)
 
-    xi = xi + delta_2 * p_xi / Q
+    if isinstance(xi, tuple):
+      xi = tuple(
+        xi[m] + delta_2 * p_xi[m] / Q[m] for m in range(chain_length)
+      )
+    else:
+      xi = xi + delta_2 * (jnp.stack(p_xi) if scalar_chain else p_xi) / Q
 
     G = f32(2) * KE - DOF * kT
 
@@ -482,11 +512,27 @@ def nose_hoover_chain(
       G = p_xi_update**2 / Q[m] - kT
       return G, p_xi_update
 
-    idx = jnp.arange(M)
-    G, p_xi_update = lax.scan(forward_loop_fn, G, idx, unroll=2)
-    p_xi = p_xi.at[idx].set(p_xi_update)
-    p_xi = p_xi.at[M].add(delta_4 * G)
+    if scalar_chain:
+      for m in range(M):
+        G, p_xi[m] = forward_loop_fn(G, m)
+      p_xi[M] = p_xi[M] + delta_4 * G
+      p_xi = tuple(p_xi)
+    else:
+      idx = jnp.arange(M)
+      G, p_xi_update = lax.scan(forward_loop_fn, G, idx, unroll=chain_unroll)
+      p_xi = p_xi.at[idx].set(p_xi_update)
+      p_xi = p_xi.at[M].add(delta_4 * G)
 
+    return P, xi, p_xi, KE
+
+  def substep_fn(delta, P, state, kT):
+    """Apply one substep while preserving the array-valued chain state."""
+    xi, p_xi, Q, _tau, KE, DOF = dataclasses.astuple(state)
+    if scalar_chain:
+      p_xi = tuple(p_xi[m] for m in range(chain_length))
+    P, xi, p_xi, KE = chain_substep_fn(delta, P, xi, p_xi, Q, KE, DOF, kT)
+    if scalar_chain:
+      p_xi = jnp.stack(p_xi)
     return P, NoseHooverChain(xi, p_xi, Q, _tau, KE, DOF), kT
 
   def half_step_chain_fn(P, state, kT):
@@ -497,12 +543,39 @@ def nose_hoover_chain(
     delta = dt / chain_steps
     ws = jnp.array(SUZUKI_YOSHIDA_WEIGHTS[sy_steps])
 
+    if scalar_chain:
+      xi, p_xi, Q, _tau, KE, DOF = dataclasses.astuple(state)
+      if scalar_positions:
+        xi = tuple(xi[m] for m in range(chain_length))
+      p_xi = tuple(p_xi[m] for m in range(chain_length))
+
+      def scalar_body_fn(carry, i):
+        P, xi, p_xi, KE = carry
+        d = f32(delta * ws[i % sy_steps])
+        return chain_substep_fn(d, P, xi, p_xi, Q, KE, DOF, kT), 0
+
+      # Keep short-chain scalars between stages; packing is only needed at
+      # half-step boundaries. Particle momenta scale every substep.
+      # Bound stage unrolling to control compilation cost.
+      P, xi, p_xi, KE = lax.scan(
+        scalar_body_fn,
+        (P, xi, p_xi, KE),
+        jnp.arange(chain_steps * sy_steps),
+        unroll=min(8, chain_steps * sy_steps),
+      )[0]
+      if scalar_positions:
+        xi = jnp.stack(xi)
+      return P, NoseHooverChain(xi, jnp.stack(p_xi), Q, _tau, KE, DOF)
+
     def body_fn(cs, i):
       d = f32(delta * ws[i % sy_steps])
       return substep_fn(d, *cs), 0
 
     P, state, _ = lax.scan(
-      body_fn, (P, state, kT), jnp.arange(chain_steps * sy_steps)
+      body_fn,
+      (P, state, kT),
+      jnp.arange(chain_steps * sy_steps),
+      unroll=min(8, chain_steps * sy_steps),
     )[0]
     return P, state
 
