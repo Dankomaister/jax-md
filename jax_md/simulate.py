@@ -2080,6 +2080,10 @@ def temp_csvr(
   nature and unlike the Berendsen thermostat it samples the true canonical
   distribution [#Braun2018]_.
 
+  The chi-square variate is sampled as a sum of squared independent standard
+  normals, requiring O(DoF) temporary work. This preserves the sampling law but
+  intentionally changes fixed-seed trajectories from the former gamma sampler.
+
   Args:
     energy_or_force: A function that produces either an energy or a force from
       a set of particle positions specified as an ndarray of shape
@@ -2108,37 +2112,13 @@ def temp_csvr(
   dt = f32(dt)
 
   def sum_noises(state, key):
-    """Sum of N independent gaussian noises squared.
-    Adapted from https://github.com/GiovanniBussi/StochasticVelocityRescaling
-    For more details see Eq.A7 Bussi et al. [#bussi2007]_"""
+    """Chi-square variate with DoF - 1 degrees of freedom (Eq. A7)."""
     dof = quantity.count_dof(state.position) - 1
     _dtype = state.position.dtype
-
-    if dof == 0:
-      """If there are no terms return zero."""
-      return 0
-
-    elif dof == 1:
-      """For a single noise term, directly calculate the square of the Gaussian
-      noise value."""
-      rr = random.normal(key, dtype=_dtype)
-      return rr * rr
-
-    elif dof % 2 == 0:
-      """For an even number of noise terms, use the gamma-distributed random
-      number generator"""
-      return 2.0 * random.gamma(key, dof // 2, dtype=_dtype)
-
-    else:
-      """For an odd number of noise terms, sum two terms: one from the
-      gamma-distributed generator and another from the square of a
-      Gaussian-distributed random number."""
-      gamma_key, normal_key = random.split(key)
-      rr = random.normal(normal_key, dtype=_dtype)
-      return (
-        2.0 * random.gamma(gamma_key, (dof - 1) // 2, dtype=_dtype)
-        + (rr * rr)
-      )
+    if dof < 0:
+      raise ValueError('CSVR requires at least one degree of freedom.')
+    z = random.normal(key, shape=(dof,), dtype=_dtype)
+    return jnp.sum(z * z, dtype=_dtype)
 
   def csvr_update(state, tau, kT, dt):
     """Update the momentum by an scaling factor as described by
