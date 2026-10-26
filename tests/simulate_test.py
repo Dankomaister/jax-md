@@ -1337,6 +1337,129 @@ class SimulateTest(test_util.JAXMDTestCase):
       assert np.abs(T_emp - T) < 0.1
       assert state.position.dtype == dtype
 
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      dict(testcase_name=f'_shape={shape}_dtype={dtype.__name__}',
+           shape=shape, dtype=dtype)
+      for shape in [(1, 1), (1, 2), (2, 3), (3, 3)]
+      for dtype in DTYPE
+    )
+  )
+  def test_temp_csvr_normal_sum_reference(self, shape, dtype):
+    _, shift = space.free()
+    dt, kT, tau = f32(0.01), dtype(0.8), dtype(0.1)
+    init, step = simulate.temp_csvr(lambda r, **kw: np.zeros_like(r),
+                                    shift, dt, kT, tau)
+    r = np.arange(shape[0] * shape[1], dtype=dtype).reshape(shape) / 10
+    p = np.ones(shape, dtype=dtype) + r
+    # Cover scalar, per-particle, and already broadcast masses.
+    mass = (dtype(2) if shape[0] == 1 else
+            np.arange(1, shape[0] + 1, dtype=dtype))
+    if shape == (3, 3):
+      mass = mass[:, None]
+    state = init(random.PRNGKey(17), r, mass=mass, momenta=p)
+    self.assertIs(type(state), simulate.NVTLangevinState)
+    self.assertLen(dataclasses.astuple(state), 5)
+    key, r1_key, r2_key = random.split(state.rng, 3)
+    f = r.size
+    r1 = random.normal(r1_key, dtype=dtype)
+    z = random.normal(r2_key, (f - 1,), dtype=dtype)
+    r2 = np.sum(z * z, dtype=dtype)
+    kinetic_energy = np.sum(p * p / state.mass) / 2
+    c = np.exp(-dt / tau)
+    a = (1 - c) * kT / (2 * kinetic_energy)
+    lam = np.sqrt(c + a * (r1 * r1 + r2) + 2 * r1 * np.sqrt(c * a))
+    expected = state.set(position=r + dt * p * lam / state.mass,
+                         momentum=p * lam, rng=key)
+    actual = jit(step)(state)
+    tol = 2e-6 if dtype is f32 else 1e-12
+    self.assertAllClose(actual, expected, atol=tol, rtol=tol)
+    self.assertEqual(jax.tree.structure(actual), jax.tree.structure(state))
+    for x, y in zip(jax.tree.leaves(actual), jax.tree.leaves(state)):
+      self.assertEqual((x.shape, x.dtype), (y.shape, y.dtype))
+    empty = state.set(position=np.empty((0, shape[1]), dtype=dtype))
+    with self.assertRaisesRegex(ValueError, 'at least one degree of freedom'):
+      jit(step)(empty)
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      dict(testcase_name=f'_d={d}_dtype={dtype.__name__}', d=d, dtype=dtype)
+      for d in [0, 1, 7, 32]
+      for dtype in DTYPE
+    )
+  )
+  def test_temp_csvr_normal_sum_moments(self, d, dtype):
+    # Recover the production chi-square draw from its momentum rescaling.
+    # Thus this checks the actual sampler, rather than a test-only duplicate.
+    _, shift = space.free()
+    init, step = simulate.temp_csvr(lambda r: np.zeros_like(r),
+                                    shift, 1., dtype(1), 1.)
+    state = init(random.PRNGKey(0), np.zeros((1, d + 1), dtype=dtype),
+                 momenta=np.ones((1, d + 1), dtype=dtype))
+    count = 8192
+    keys = random.split(random.PRNGKey(123 + d), count)
+    def recover(key):
+      updated = step(state.set(rng=key))
+      _, r1_key, _ = random.split(key, 3)
+      r1 = random.normal(r1_key, dtype=dtype)
+      c = np.exp(-f32(1))
+      a = (1 - c) / (d + 1)
+      return ((updated.momentum[0, 0] ** 2 - c
+               - 2 * r1 * np.sqrt(c * a)) / a - r1 * r1)
+    samples = jit(vmap(recover))(keys)
+    self.assertTrue(np.all(np.isfinite(samples)))
+    if d == 0:
+      self.assertAllClose(samples, np.zeros_like(samples), atol=1e-5)
+    else:
+      # Seven standard errors: Var(X)=2d; Var((X-d)^2)=8d(d+6).
+      self.assertLess(abs(float(np.mean(samples)) - d),
+                      7 * (2 * d / count) ** 0.5)
+      self.assertLess(abs(float(np.var(samples)) - 2 * d),
+                      7 * (8 * d * (d + 6) / count) ** 0.5)
+
+  @parameterized.named_parameters(
+    test_util.cases_from_list(
+      dict(testcase_name=f'_dtype={dtype.__name__}', dtype=dtype)
+      for dtype in DTYPE
+    )
+  )
+  def test_temp_csvr_normal_sum_transforms(self, dtype):
+    _, shift = space.free()
+    def force(r, strength):
+      return -strength * r
+    init, step = simulate.temp_csvr(force, shift, 0.01, dtype(1), 0.1)
+    r = random.normal(random.PRNGKey(1), (32, 3), dtype=dtype)
+    p = random.normal(random.PRNGKey(2), r.shape, dtype=dtype)
+    state = init(random.PRNGKey(3), r, mass=dtype(2), momenta=p,
+                 strength=dtype(1))
+    def advance(s, n):
+      return lax.fori_loop(0, n, lambda _, s: step(s, strength=dtype(1)), s)
+    run = jit(partial(advance, n=512))
+    final = run(state)
+    self.assertAllClose(final, run(state), atol=0, rtol=0)
+    # A restored ordinary state suffices; no external RNG state is needed.
+    restored = jax.tree.map(lambda x: np.array(x, copy=True),
+                            jit(partial(advance, n=256))(state))
+    self.assertAllClose(final, jit(partial(advance, n=256))(restored),
+                        atol=0, rtol=0)
+    self.assertTrue(all(np.all(np.isfinite(x)) for x in jax.tree.leaves(final)))
+    self.assertEqual(final.position.dtype, dtype)
+    self.assertEqual(final.position.shape, r.shape)
+    self.assertGreater(float(simulate.temperature(final)), 0.4)
+    self.assertLess(float(simulate.temperature(final)), 1.8)
+    self.assertFalse(bool(np.array_equal(final.rng, state.rng)))
+    # Fixed keys make the position/momentum map differentiable through the loop.
+    def observable(r, p):
+      s = advance(state.set(position=r, momentum=p, force=force(r, dtype(1))), 3)
+      return np.sum(s.position ** 2 + s.momentum ** 2)
+    grad = jit(jax.grad(observable, argnums=(0, 1)))(r, p)
+    _, tangent = jit(lambda r, p: jax.jvp(observable, (r, p),
+                                         (np.ones_like(r), np.ones_like(p))))(r, p)
+    self.assertTrue(all(np.all(np.isfinite(x)) for x in grad))
+    tol = 2e-5 if dtype is f32 else 1e-12
+    self.assertAllClose(tangent, np.sum(grad[0]) + np.sum(grad[1]),
+                        atol=tol, rtol=tol)
+
 
 if __name__ == '__main__':
   absltest.main()
