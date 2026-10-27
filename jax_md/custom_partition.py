@@ -3,6 +3,11 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as onp
+
+try:
+  from jax import enable_x64
+except ImportError:  # JAX < 0.11 exposes the same scoped context here.
+  from jax.experimental import enable_x64
 from jax_md import dataclasses, partition, space, util
 from jax_md.partition import NeighborListFormat
 from typing import Callable, Tuple, Union
@@ -181,13 +186,8 @@ def _compute_shift_ranges(
     Integer shift vectors spanning the required range. Shape
     ``[num_shifts, dim]``. Each row is a shift vector :math:`(n_1, n_2, \ldots, n_d)`.
   """
-  # Reciprocal lattice vectors (columns of inv_box.T)
-  inv_box_T = jnp.linalg.inv(box).T  # [dim, dim]
-  # Perpendicular heights of the box
-  heights = 1.0 / jnp.linalg.norm(inv_box_T, axis=0)  # [dim]
-  # Number of shifts needed per direction.
-  n_max = jnp.ceil(r_cutoff / heights).astype(i32)  # [dim]
-  n_max = jnp.where(pbc, n_max, 0)  # [dim], zero for non-periodic
+  # Allocation and updates must use the same conservative geometry check.
+  n_max = _compute_shift_n_max(box, r_cutoff, pbc)
 
   # Build Cartesian product of shift ranges
   dim = box.shape[0]
@@ -201,22 +201,71 @@ def _compute_shift_n_max(
   box: Array,  # [dim, dim]
   r_cutoff: util.ArrayLike,
   pbc: Array,  # [dim]
-  *,
-  use_reciprocal_cross: bool = False,
 ) -> Array:  # [dim]
-  """Compute per-axis multi-image shift extents with fixed output shape."""
-  if use_reciprocal_cross and box.shape == (3, 3):
-    # Reciprocal lattice rows are cross products of the other two columns,
-    # divided by the scalar triple product. This small device-only calculation
-    # avoids solver custom calls inside the stored-box conditional.
-    a, b, c = box.T
-    cofactors = jnp.stack((jnp.cross(b, c), jnp.cross(c, a), jnp.cross(a, b)))
-    volume = jnp.sum(a * cofactors[0])
-    inv_box_T = (cofactors / volume).T
-  else:
-    inv_box_T = jnp.linalg.inv(box).T  # [dim, dim]
-  heights = 1.0 / jnp.linalg.norm(inv_box_T, axis=0)  # [dim]
-  n_max = jnp.ceil(r_cutoff / heights).astype(i32)  # [dim]
+  """Compute conservative image extents with fixed output shape."""
+  if box.shape == (3, 3):
+    # Ceil is discontinuous at integers: float32 reciprocal arithmetic can
+    # round a ratio just above an integer down to it. Widen only this tiny
+    # geometry calculation, leaving coordinates, distances and JAX defaults
+    # unchanged. Bound cancellation in both cross and scalar triple products.
+    with enable_x64():
+      cell = box.astype(jnp.float64)
+      cutoff = jnp.asarray(r_cutoff, dtype=jnp.float64)
+      a, b, c = cell.T
+      cofactors = jnp.stack((jnp.cross(b, c), jnp.cross(c, a), jnp.cross(a, b)))
+      # Absolute sums of the two products in each cofactor component.
+      absolute_products = jnp.stack((
+        jnp.abs(b[jnp.array([1, 2, 0])] * c[jnp.array([2, 0, 1])])
+        + jnp.abs(b[jnp.array([2, 0, 1])] * c[jnp.array([1, 2, 0])]),
+        jnp.abs(c[jnp.array([1, 2, 0])] * a[jnp.array([2, 0, 1])])
+        + jnp.abs(c[jnp.array([2, 0, 1])] * a[jnp.array([1, 2, 0])]),
+        jnp.abs(a[jnp.array([1, 2, 0])] * b[jnp.array([2, 0, 1])])
+        + jnp.abs(a[jnp.array([2, 0, 1])] * b[jnp.array([1, 2, 0])]),
+      ))
+      unit_roundoff = jnp.finfo(jnp.float64).eps / 2
+      def gamma(n):
+        return n * unit_roundoff / (1 - n * unit_roundoff)
+      volume = jnp.abs(jnp.sum(a * cofactors[0]))
+      # gamma(8) bounds the six signed triple products and their sum;
+      # gamma(2) bounds each two-product cofactor subtraction. Inflate the
+      # computed error bounds as well, so their rounding is conservative.
+      volume_error = gamma(8) * jnp.sum(jnp.abs(a) * absolute_products[0])
+      volume_lower = volume - volume_error * (1 + gamma(3))
+      cofactor_upper = jnp.abs(cofactors) + gamma(2) * absolute_products
+      norm_upper = jnp.linalg.norm(cofactor_upper, axis=1) * (1 + gamma(5))
+      ratio_upper = cutoff * norm_upper / volume_lower * (1 + gamma(3))
+      # A row with only its diagonal entry nonzero gives an exact axis-aligned
+      # reciprocal row, even if other rows contain shear. Such rows need no
+      # cancellation bound. Widened division resolves adjacent float32 inputs
+      # without adding a layer at an exact integer ratio.
+      diagonal = jnp.diag(cell)
+      axis_aligned = jnp.all(cell == jnp.diag(diagonal), axis=1)
+      aligned_ratio = cutoff / jnp.abs(diagonal)
+      if box.dtype == jnp.float64:
+        # An arbitrary float64 quotient can round down to an integer. An
+        # upward adjacent value bounds division error, except where an exact
+        # tie can be certified: a diagonal with <=24 significant bits times
+        # a small integer fits in 53 bits, or the scale is a power of two.
+        integer = jnp.floor(aligned_ratio)
+        mantissa, _ = jnp.frexp(integer)
+        diagonal_mantissa, _ = jnp.frexp(diagonal)
+        significand = diagonal_mantissa * 2**24
+        short_significand = significand == jnp.floor(significand)
+        exact_product = (
+          (short_significand & (integer < 2**29)) | (mantissa == .5)
+        )
+        exact_tie = exact_product & (cutoff == integer * jnp.abs(diagonal))
+        aligned_ratio = jnp.where(
+          exact_tie, aligned_ratio, jnp.nextafter(aligned_ratio, jnp.inf)
+        )
+      ratio = jnp.where(axis_aligned, aligned_ratio, ratio_upper)
+      # An uncertifiable/singular geometry must never appear stencil-safe.
+      ratio = jnp.where((volume_lower > 0) | axis_aligned, ratio, jnp.inf)
+      n_max = jnp.ceil(ratio).astype(i32)
+    return jnp.where(pbc, n_max, 0)
+  inv_box_T = jnp.linalg.inv(box).T
+  heights = 1.0 / jnp.linalg.norm(inv_box_T, axis=0)
+  n_max = jnp.ceil(r_cutoff / heights).astype(i32)
   return jnp.where(pbc, n_max, 0)
 
 
@@ -1084,23 +1133,22 @@ def neighbor_list_multi_image(
 
     def check_shift_range_overflow(box):
       required_shift_n_max = _compute_shift_n_max(
-        box, search_cutoff, pbc, use_reciprocal_cross='box' not in kwargs
+        box, search_cutoff, pbc
       )
       allocated_shift_n_max = jnp.max(
         jnp.abs(neighbors.search_shifts), axis=0
       ).astype(i32)
       return jnp.any(required_shift_n_max > allocated_shift_n_max)
 
-    # A valid list's stencil already covers its reference box. Avoid a matrix
-    # inverse on fixed-cell updates. An overflowing rebuild also refreshes
-    # reference_box, so equality alone cannot certify that stencil as valid.
+    # A valid list's stencil already covers its reference box. An overflowing
+    # rebuild also refreshes reference_box, so equality alone cannot certify
+    # that stencil as valid.
     if 'box' in kwargs:
-      # Explicit cell updates retain the general path: the inverse branch can
-      # require a host predicate, adding overhead when the cell is changing.
+      # Explicit cell updates always check the required image extent.
       shift_range_overflow = check_shift_range_overflow(current_box)
     elif dim == 3:
-      # The reciprocal cross-product calculation is cheap enough to evaluate
-      # unconditionally, avoiding another conditional command buffer.
+      # Evaluate scalar geometry unconditionally: a second device conditional
+      # costs more than this arithmetic on the measured no-rebuild path.
       shift_range_overflow = jnp.where(
         jnp.all(current_box == neighbors.reference_box)
         & ~jnp.asarray(neighbors.did_buffer_overflow),

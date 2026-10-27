@@ -1351,7 +1351,7 @@ class CustomPartitionTest(parameterized.TestCase):
       0,
     ).astype(np.int32)
     fast = jax.jit(jax.vmap(lambda box: _compute_shift_n_max(
-      box, 7., pbc, use_reciprocal_cross=True
+      box, 7., pbc
     )))(jnp.asarray(boxes))
     np.testing.assert_array_equal(fast, expected)
 
@@ -1434,6 +1434,193 @@ class CustomPartitionTest(parameterized.TestCase):
       np.testing.assert_array_equal(again.reference_position, state.reference_position)
       np.testing.assert_array_equal(again.reference_box, state.reference_box)
       self.assertEqual(_image_edges(again, len(pos)), _image_edges(state, len(pos)))
+
+  @parameterized.parameters(
+    (True, True, True), (True, False, True), (False, False, False),
+  )
+  def test_reciprocal_integer_boundaries(self, px, py, pz):
+    """Outward geometry agrees with exact rational squared-ratio comparisons."""
+    from fractions import Fraction
+    from jax_md.custom_partition import _compute_shift_n_max
+
+    def exact_extent(box):
+      a, b, c = [[Fraction(float(v)) for v in row] for row in box.T]
+      def cross(x, y):
+        return [x[(i+1)%3]*y[(i+2)%3] - x[(i+2)%3]*y[(i+1)%3]
+                for i in range(3)]
+      cofactors = [cross(b, c), cross(c, a), cross(a, b)]
+      volume = sum(x*y for x, y in zip(a, cofactors[0]))
+      approx = np.ceil(7*np.linalg.norm(np.linalg.inv(box.astype(float)), axis=1))
+      result = []
+      for row, n in zip(cofactors, approx):
+        squared = 49*sum(x*x for x in row)
+        n = int(n)
+        while n*n*volume*volume < squared:
+          n += 1
+        while n and (n-1)**2*volume*volume >= squared:
+          n -= 1
+        result.append(n)
+      return result
+
+    rng = np.random.default_rng(38219)
+    cells = []
+    for kind in ('diagonal', 'triangular', 'skew', 'conditioned'):
+      for k in range(8):
+        cell = rng.normal(size=(3, 3))*.7 + np.diag([2., 3., 4.])
+        if kind == 'diagonal':
+          cell = np.diag([2., 3., 4.])
+        if kind == 'triangular':
+          cell = np.triu(cell)
+        if kind == 'conditioned':
+          cell[:, 1] = .9*cell[:, 0] + .015*cell[:, 1]
+        ratio = 7*np.linalg.norm(np.linalg.inv(cell), axis=1)[k % 3]
+        for integer in (1, 2):
+          center = (cell*ratio/integer).astype(np.float32)
+          for ulps in range(-3, 4):
+            value = center.copy()
+            for _ in range(abs(ulps)):
+              value = np.where(value == 0, value, np.nextafter(
+                value, np.float32(np.inf if ulps > 0 else -np.inf)))
+            cells.append(value)
+    # Exact rotated-cube ties exercise conservative ambiguity for reciprocal
+    # rows that are not structurally axis-aligned (at most one extra layer).
+    rotated = np.array([[2., 3., 6.], [3., -6., 2.], [6., 2., -3.]], np.float32)
+    cells.extend((rotated, rotated / np.float32(2)))
+    cells = np.asarray(cells)
+    pbc = np.array([px, py, pz])
+    expected = np.where(pbc, [exact_extent(cell) for cell in cells], 0)
+    actual = np.asarray(jax.jit(jax.vmap(lambda box: _compute_shift_n_max(
+      box, 7., pbc)))(jnp.asarray(cells)))
+    self.assertTrue(np.all(actual >= expected))
+    self.assertTrue(np.all(actual <= expected + 1))
+    # Additional images are allowed only in the narrow certified-error band.
+    ratios = 7*np.linalg.norm(np.linalg.inv(cells.astype(float)), axis=2)
+    self.assertTrue(np.all((actual == expected) | (np.abs(ratios-expected) < 1e-10)))
+    # Exactly representable diagonal ties need no additional image layer.
+    diagonal = np.diag(np.array([7., 3.5, 14.], np.float32))
+    np.testing.assert_array_equal(_compute_shift_n_max(diagonal, 7., pbc),
+                                  np.where(pbc, [1, 2, 1], 0))
+
+  @parameterized.product(
+    fmt=(NeighborListFormat.Dense, NeighborListFormat.Sparse,
+         NeighborListFormat.OrderedSparse),
+    fractional=(False, True),
+    partial=(False, True),
+  )
+  def test_ulp_extent_physical_pairs(self, fmt, fractional, partial):
+    """A one-ULP cell contraction needs the second image at a cell face."""
+    box = np.diag(np.array([np.nextafter(np.float32(7), np.float32(0)),
+                            8., 9.], np.float32))
+    pbc = np.array([True, not partial, not partial])
+    # Native coordinates may include a cell face; no wrapping is performed.
+    frac = np.array([[0., .25, .25], [1., .25, .25]], np.float32)
+    pos = frac if fractional else frac @ box.T
+    fn = neighbor_list_multi_image(
+      None, box, 6., dr_threshold=1., format=fmt, pbc=pbc,
+      fractional_coordinates=fractional,
+    )
+    state = fn.allocate(pos, extra_capacity=32)
+    expected = {edge for edge in _reference_image_edges(pos, box, 7., fractional, fmt)
+                if all(pbc[d] or edge[2][d] == 0 for d in range(3))}
+    self.assertFalse(bool(state.did_buffer_overflow))
+    self.assertEqual(_image_edges(state, len(pos)), expected)
+    self.assertTrue(any(abs(edge[2][0]) == 2 for edge in expected))
+    update = jax.jit(fn.update)
+    for step in range(1, 4):
+      moved = pos.copy()
+      moved[:, 1] += .001*step
+      state = update(moved, state)
+      self.assertFalse(bool(state.did_buffer_overflow))
+      np.testing.assert_array_equal(state.reference_position, pos)
+    # A real rebuild must still use the corrected allocation's full stencil.
+    moved = pos.copy()
+    moved[:, 1] += .7
+    state = update(moved, state)
+    self.assertFalse(bool(state.did_buffer_overflow))
+    expected = {edge for edge in _reference_image_edges(moved, box, 7., fractional, fmt)
+                if all(pbc[d] or edge[2][d] == 0 for d in range(3))}
+    self.assertEqual(_image_edges(state, len(pos)), expected)
+
+  @parameterized.product(
+    fmt=(NeighborListFormat.Dense, NeighborListFormat.Sparse,
+         NeighborListFormat.OrderedSparse),
+    fractional=(False, True),
+    partial=(False, True),
+  )
+  def test_skew_ulp_extent_growth_recovery(self, fmt, fractional, partial):
+    """Equal reference/current boxes cannot clear a failed stencil rebuild."""
+    box = np.array([
+      [6.723207950592041, 5.211406707763672, -.34726378321647644],
+      [-3.9846396446228027, 10.97922420501709, 6.34798526763916],
+      [-4.099090576171875, 2.1310067176818848, 18.76858901977539],
+    ], np.float32)
+    pbc = np.array([True, not partial, True])
+    large = box*np.float32(1.00001)
+    frac = np.array([[.08, .2, .3], [.89, .22, .31], [.41, .8, .6]], np.float32)
+    pos = frac if fractional else frac @ box.T
+    fn = neighbor_list_multi_image(
+      None, large, 6., dr_threshold=1., format=fmt, pbc=pbc,
+      fractional_coordinates=fractional,
+    )
+    state = fn.allocate(pos, extra_capacity=64)
+    self.assertEqual(int(np.max(np.abs(state.search_shifts[:, 0]))), 1)
+    update = jax.jit(fn.update)
+    state = update(pos, state, box=box)
+    self.assertTrue(bool(state.did_buffer_overflow))
+    np.testing.assert_array_equal(state.reference_box, box)
+    for _ in range(3):
+      state = update(pos, state)
+      self.assertTrue(bool(state.did_buffer_overflow))
+      np.testing.assert_array_equal(state.reference_box, box)
+    # Force another actual rebuild with equal current/reference boxes; merely
+    # reusing the failed list would leave its old overflow flag set anyway.
+    moved = pos.copy()
+    moved[0, 0] += .7 if not fractional else .7 / np.linalg.norm(box[:, 0])
+    state = update(moved, state)
+    self.assertTrue(bool(state.did_buffer_overflow))
+    state = fn.allocate(pos, box=box, extra_capacity=64)
+    self.assertEqual(int(np.max(np.abs(state.search_shifts[:, 0]))), 2)
+    expected = {edge for edge in _reference_image_edges(pos, box, 7., fractional, fmt)
+                if all(pbc[d] or edge[2][d] == 0 for d in range(3))}
+    self.assertEqual(_image_edges(state, len(pos)), expected)
+    for _ in range(3):
+      state = update(pos, state)
+      self.assertFalse(bool(state.did_buffer_overflow))
+      self.assertEqual(_image_edges(state, len(pos)), expected)
+
+  def test_float64_reciprocal_integer_boundary(self):
+    """Explicit float64 callers need outward division at neighboring ties."""
+    from fractions import Fraction
+    from jax_md.custom_partition import _compute_shift_n_max, enable_x64
+
+    original_default = jax.config.x64_enabled
+    with enable_x64():
+      d = np.nextafter(np.float64(1), np.float64(2))
+      cells, cutoffs = [], []
+      for diagonal in (np.nextafter(d, 0.), d, np.nextafter(d, np.inf)):
+        for ulps in range(-2, 3):
+          cutoff = np.float64(3*diagonal)
+          for _ in range(abs(ulps)):
+            cutoff = np.nextafter(cutoff, np.inf if ulps > 0 else -np.inf)
+          cells.append(np.diag([diagonal, 4., 5.]))
+          cutoffs.append(cutoff)
+      cells, cutoffs = np.asarray(cells), np.asarray(cutoffs)
+      expected = []
+      for cell, cutoff in zip(cells, cutoffs):
+        ratios = [Fraction(float(cutoff))/Fraction(float(x)) for x in np.diag(cell)]
+        expected.append([(x.numerator+x.denominator-1)//x.denominator for x in ratios])
+      for pbc in ([True, True, True], [True, False, True], [False]*3):
+        actual = np.asarray(jax.jit(jax.vmap(lambda box, cutoff:
+          _compute_shift_n_max(box, cutoff, np.array(pbc))))(cells, cutoffs))
+        wanted = np.where(pbc, expected, 0)
+        self.assertTrue(np.all(actual >= wanted))
+        self.assertTrue(np.all(actual <= wanted+1))
+      # Exact power-of-two ties can be certified without extra image layers.
+      for n in (1, 2, 4):
+        actual = _compute_shift_n_max(jnp.diag(jnp.array([d, 2*d, 4*d])),
+                                      n*d, np.ones(3, bool))
+        np.testing.assert_array_equal(actual, [n, max(1, n//2), max(1, n//4)])
+    self.assertEqual(jax.config.x64_enabled, original_default)
 
   def test_empty_system(self):
     """Test behavior with a single atom (no neighbors)."""
