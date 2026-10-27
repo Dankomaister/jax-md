@@ -201,9 +201,20 @@ def _compute_shift_n_max(
   box: Array,  # [dim, dim]
   r_cutoff: util.ArrayLike,
   pbc: Array,  # [dim]
+  *,
+  use_reciprocal_cross: bool = False,
 ) -> Array:  # [dim]
   """Compute per-axis multi-image shift extents with fixed output shape."""
-  inv_box_T = jnp.linalg.inv(box).T  # [dim, dim]
+  if use_reciprocal_cross and box.shape == (3, 3):
+    # Reciprocal lattice rows are cross products of the other two columns,
+    # divided by the scalar triple product. This small device-only calculation
+    # avoids solver custom calls inside the stored-box conditional.
+    a, b, c = box.T
+    cofactors = jnp.stack((jnp.cross(b, c), jnp.cross(c, a), jnp.cross(a, b)))
+    volume = jnp.sum(a * cofactors[0])
+    inv_box_T = (cofactors / volume).T
+  else:
+    inv_box_T = jnp.linalg.inv(box).T  # [dim, dim]
   heights = 1.0 / jnp.linalg.norm(inv_box_T, axis=0)  # [dim]
   n_max = jnp.ceil(r_cutoff / heights).astype(i32)  # [dim]
   return jnp.where(pbc, n_max, 0)
@@ -988,8 +999,10 @@ def neighbor_list_multi_image(
 
     # box deformation moves that periodic image by
     # shift @ (box - reference_box).T; this can dominate for large shifts
-    shift_delta = jnp.matmul(
-      nl_shifts, (box - reference_box).T, precision='highest'
+    # Explicit scalar products keep full precision and let the small
+    # deformation calculation fuse with its norm/reduction.
+    shift_delta = jnp.sum(
+      nl_shifts[:, None, :] * (box - reference_box)[None, :, :], axis=-1
     )
     max_shift_disp = jnp.sqrt(jnp.max(jnp.sum(shift_delta**2, axis=-1)))
     # any pair displacement can change by at most the motion of both atoms plus
@@ -1068,11 +1081,40 @@ def neighbor_list_multi_image(
     position = position.astype(neighbors.reference_position.dtype)
 
     current_box = jnp.asarray(kwargs.get('box', neighbors.box))
-    required_shift_n_max = _compute_shift_n_max(current_box, search_cutoff, pbc)
-    allocated_shift_n_max = jnp.max(
-      jnp.abs(neighbors.search_shifts), axis=0
-    ).astype(i32)
-    shift_range_overflow = jnp.any(required_shift_n_max > allocated_shift_n_max)
+
+    def check_shift_range_overflow(box):
+      required_shift_n_max = _compute_shift_n_max(
+        box, search_cutoff, pbc, use_reciprocal_cross='box' not in kwargs
+      )
+      allocated_shift_n_max = jnp.max(
+        jnp.abs(neighbors.search_shifts), axis=0
+      ).astype(i32)
+      return jnp.any(required_shift_n_max > allocated_shift_n_max)
+
+    # A valid list's stencil already covers its reference box. Avoid a matrix
+    # inverse on fixed-cell updates. An overflowing rebuild also refreshes
+    # reference_box, so equality alone cannot certify that stencil as valid.
+    if 'box' in kwargs:
+      # Explicit cell updates retain the general path: the inverse branch can
+      # require a host predicate, adding overhead when the cell is changing.
+      shift_range_overflow = check_shift_range_overflow(current_box)
+    elif dim == 3:
+      # The reciprocal cross-product calculation is cheap enough to evaluate
+      # unconditionally, avoiding another conditional command buffer.
+      shift_range_overflow = jnp.where(
+        jnp.all(current_box == neighbors.reference_box)
+        & ~jnp.asarray(neighbors.did_buffer_overflow),
+        False,
+        check_shift_range_overflow(current_box),
+      )
+    else:
+      shift_range_overflow = jax.lax.cond(
+        jnp.all(current_box == neighbors.reference_box)
+        & ~jnp.asarray(neighbors.did_buffer_overflow),
+        lambda box: jnp.array(False),
+        check_shift_range_overflow,
+        current_box,
+      )
 
     capacity = neighbors.max_occupancy
     build_fn = get_build_fn(capacity)

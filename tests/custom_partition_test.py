@@ -194,7 +194,9 @@ def _reference_image_edges(position, box, cutoff, fractional, fmt):
   box = np.asarray(box, dtype=np.float64)
   position = np.asarray(position, dtype=np.float64)
   real = position @ box.T if fractional else position
-  extent = np.ceil(1 + cutoff * np.linalg.norm(np.linalg.inv(box), axis=1)).astype(int)
+  extent = np.ceil(
+    1 + cutoff * np.linalg.norm(np.linalg.inv(box), axis=1)
+  ).astype(int)
   edges = set()
   for shift in itertools.product(*(range(-n, n + 1) for n in extent)):
     delta = real[None, :, :] + np.asarray(shift) @ box.T - real[:, None, :]
@@ -230,7 +232,9 @@ def _image_edges(nbrs, n):
     assert np.all(shifts[~valid] == 0)
     i, j = idx[:, valid]
     selected = shifts[valid]
-  keys = [(int(a), int(b), tuple(map(int, s))) for a, b, s in zip(i, j, selected)]
+  keys = [
+    (int(a), int(b), tuple(map(int, s))) for a, b, s in zip(i, j, selected)
+  ]
   assert len(keys) == len(set(keys))
   return set(keys)
 
@@ -359,7 +363,11 @@ class CustomPartitionTest(parameterized.TestCase):
 
 
   @parameterized.product(
-    fmt=(NeighborListFormat.Dense, NeighborListFormat.Sparse, NeighborListFormat.OrderedSparse),
+    fmt=(
+      NeighborListFormat.Dense,
+      NeighborListFormat.Sparse,
+      NeighborListFormat.OrderedSparse,
+    ),
     fractional=(False, True),
     cutoff=(3.5, 3.5002, 3.5015),
   )
@@ -1175,6 +1183,257 @@ class CustomPartitionTest(parameterized.TestCase):
     self.assertTrue(bool(updated.did_buffer_overflow))
     n_edges = int(jnp.sum(updated.idx[0] < len(pos_frac)))
     self.assertLess(n_edges, updated.max_occupancy)
+
+  @parameterized.product(
+    fmt=(
+      NeighborListFormat.Dense,
+      NeighborListFormat.Sparse,
+      NeighborListFormat.OrderedSparse,
+    ),
+    fractional=(False, True),
+    triclinic=(False, True),
+  )
+  def test_reuse_then_threshold_rebuild(self, fmt, fractional, triclinic):
+    """Reuse preserves references; >= skin/2 rebuilds with correct images."""
+    box = np.diag(np.array([8., 7., 6.], dtype=np.float32))
+    if triclinic:
+      box[0, 1], box[0, 2], box[1, 2] = 1., .5, 1.
+    frac = np.array(
+      [[0.25, 0.25, 0.25], [0.375, 0.25, 0.25], [0.5, 0.375, 0.25]],
+      dtype=np.float32,
+    )
+    pos = frac if fractional else frac @ box.T
+    fn = neighbor_list_multi_image(
+      None, box * 1.2, 6., dr_threshold=1., format=fmt,
+      fractional_coordinates=fractional,
+    )
+    # Allocation override differs from the factory box.
+    original = fn.allocate(pos, box=box, extra_capacity=16)
+    update = jax.jit(fn.update)
+    state = original
+    for delta in (.03, .17, .499):
+      moved = pos.copy()
+      moved[0, 0] += delta / box[0, 0] if fractional else delta
+      if delta == .17:
+        state = update(moved, state, box=box)
+      else:
+        state = update(moved, state)
+      self.assertFalse(bool(state.did_buffer_overflow))
+      np.testing.assert_array_equal(state.reference_position, pos)
+      np.testing.assert_array_equal(state.reference_box, box)
+      self.assertEqual(
+        _image_edges(state, len(pos)), _image_edges(original, len(pos))
+      )
+    for delta in (.5, .501):
+      moved = pos.copy()
+      moved[0, 0] += delta / box[0, 0] if fractional else delta
+      # Start from the reused state so exactly .5 and just above .5 each
+      # exercise the original allocation reference, not the previous rebuild.
+      rebuilt = update(moved, state)
+      self.assertFalse(bool(rebuilt.did_buffer_overflow))
+      np.testing.assert_array_equal(rebuilt.reference_position, moved)
+      expected = _reference_image_edges(moved, box, 7., fractional, fmt)
+      self.assertEqual(_image_edges(rebuilt, len(pos)), expected)
+      again = update(moved, rebuilt)
+      np.testing.assert_array_equal(again.reference_position, moved)
+      self.assertEqual(_image_edges(again, len(pos)), expected)
+
+  @parameterized.product(
+    fmt=(
+      NeighborListFormat.Dense,
+      NeighborListFormat.Sparse,
+      NeighborListFormat.OrderedSparse,
+    ),
+    fractional=(False, True),
+    triclinic=(False, True),
+  )
+  def test_repeated_cell_deformation_then_rebuild(self, fmt, fractional, triclinic):
+    """The current box can differ from the allocation box across reuse."""
+    box = np.diag(np.array([8., 7., 6.], dtype=np.float32))
+    if triclinic:
+      box[0, 1], box[1, 2] = 1., .5
+    frac = np.array(
+      [[0.25, 0.25, 0.25], [0.375, 0.25, 0.25], [0.5, 0.375, 0.25]],
+      dtype=np.float32,
+    )
+    pos = frac if fractional else frac @ box.T
+    fn = neighbor_list_multi_image(
+      None, box, 6., dr_threshold=1., format=fmt,
+      fractional_coordinates=fractional,
+    )
+    original = fn.allocate(pos, extra_capacity=16)
+    state = original
+    update = jax.jit(fn.update)
+    for amount in (.005, .01, .02):
+      small = box.copy()
+      small[0, 1] += amount
+      state = update(pos, state, box=small)
+      self.assertFalse(bool(state.did_buffer_overflow))
+      np.testing.assert_array_equal(state.reference_box, box)
+      np.testing.assert_array_equal(state.box, small)
+      self.assertEqual(
+        _image_edges(state, len(pos)), _image_edges(original, len(pos))
+      )
+      # No keyword means use stored current box, not the factory/default box.
+      state = update(pos, state)
+      np.testing.assert_array_equal(state.reference_box, box)
+      np.testing.assert_array_equal(state.box, small)
+    large = box * 1.3
+    rebuilt = update(pos, state, box=large)
+    self.assertFalse(bool(rebuilt.did_buffer_overflow))
+    np.testing.assert_array_equal(rebuilt.reference_box, large)
+    np.testing.assert_array_equal(rebuilt.box, large)
+    self.assertEqual(
+      _image_edges(rebuilt, len(pos)),
+      _reference_image_edges(pos, large, 7., fractional, fmt),
+    )
+
+  @parameterized.product(
+    fmt=(
+      NeighborListFormat.Dense,
+      NeighborListFormat.Sparse,
+      NeighborListFormat.OrderedSparse,
+    ),
+    fractional=(False, True),
+    threshold=(0., 1.),
+  )
+  def test_small_cell_change_requires_new_image_extent(
+    self, fmt, fractional, threshold
+  ):
+    """Stencil growth must flag even below the deformation rebuild bound."""
+    radius = 6. + threshold
+    box = np.eye(3, dtype=np.float32) * (radius + .01)
+    smaller = np.eye(3, dtype=np.float32) * (radius - .01)
+    frac = np.array([[.25, .25, .25]], dtype=np.float32)
+    pos = frac if fractional else frac @ box.T
+    fn = neighbor_list_multi_image(
+      None, box, 6., dr_threshold=threshold, format=fmt,
+      fractional_coordinates=fractional,
+    )
+    state = fn.allocate(pos, extra_capacity=100)
+    update = jax.jit(fn.update)
+    state = update(pos, state, box=smaller)
+    self.assertTrue(bool(state.did_buffer_overflow))
+    np.testing.assert_array_equal(state.reference_box, smaller)
+    # Repeating the overflowing box still detects the insufficient stencil,
+    # even though it now equals reference_box after the attempted rebuild.
+    repeated = update(pos, state)
+    self.assertTrue(bool(repeated.did_buffer_overflow))
+    # Reallocation recomputes the stencil; independent images must then agree.
+    allocated = fn.allocate(pos, box=smaller, extra_capacity=100)
+    self.assertFalse(bool(allocated.did_buffer_overflow))
+    self.assertEqual(
+      _image_edges(allocated, len(pos)),
+      _reference_image_edges(pos, smaller, radius, fractional, fmt),
+    )
+    final = update(pos, allocated)
+    self.assertFalse(bool(final.did_buffer_overflow))
+    self.assertEqual(
+      _image_edges(final, len(pos)), _image_edges(allocated, len(pos))
+    )
+
+  @parameterized.parameters(
+    (True, True, True), (True, False, True), (False, False, False),
+  )
+  def test_reciprocal_extent_geometry(self, px, py, pz):
+    """Fast reciprocal extents agree with independent float64 geometry."""
+    from jax_md.custom_partition import _compute_shift_n_max
+
+    rng = np.random.default_rng(2031)
+    boxes = rng.uniform(-.8, .8, (96, 3, 3)).astype(np.float32)
+    boxes += np.diag(np.array([3.1, 5.3, 7.7], np.float32))
+    # Include nontriangular rotations, negative determinants and varying scales.
+    boxes[::2] *= -1
+    boxes *= np.linspace(.5, 2., len(boxes), dtype=np.float32)[:, None, None]
+    pbc = np.array([px, py, pz])
+    expected = np.where(
+      pbc, np.ceil(7 * np.linalg.norm(np.linalg.inv(boxes.astype(float)), axis=2)),
+      0,
+    ).astype(np.int32)
+    fast = jax.jit(jax.vmap(lambda box: _compute_shift_n_max(
+      box, 7., pbc, use_reciprocal_cross=True
+    )))(jnp.asarray(boxes))
+    np.testing.assert_array_equal(fast, expected)
+
+  @parameterized.product(
+    fmt=(NeighborListFormat.Dense, NeighborListFormat.Sparse,
+         NeighborListFormat.OrderedSparse),
+    fractional=(False, True),
+  )
+  def test_stored_cell_extent_partial_pbc(self, fmt, fractional):
+    """Omitted-box fallback handles growth, overflow reuse and recovery."""
+    box = np.array([[7.03, .4, .2], [0., 8., .3], [0., 0., 9.]], np.float32)
+    small = box.copy()
+    small[0, 0] = 6.95
+    frac = np.array([[.2, .2, .2], [.3, .25, .2]], np.float32)
+    pos = frac if fractional else frac @ box.T
+    pbc = np.array([True, False, True])
+    fn = neighbor_list_multi_image(
+      None, box, 6., dr_threshold=1., format=fmt, pbc=pbc,
+      fractional_coordinates=fractional,
+    )
+    state = fn.allocate(pos, extra_capacity=64)
+    update = jax.jit(fn.update)
+    # Store a different box without bypassing the normal update protocol.
+    state = update(pos, state, box=small)
+    for _ in range(3):
+      state = update(pos, state)
+      self.assertTrue(bool(state.did_buffer_overflow))
+    state = fn.allocate(pos, box=small, extra_capacity=64)
+    original = state
+    for _ in range(3):
+      state = update(pos, state)
+      self.assertFalse(bool(state.did_buffer_overflow))
+      self.assertEqual(_image_edges(state, len(pos)), _image_edges(original, len(pos)))
+    moved = pos.copy()
+    moved[0, 0] += .7 / small[0, 0] if fractional else .7
+    state = update(moved, state)
+    self.assertFalse(bool(state.did_buffer_overflow))
+    expected = {
+      edge for edge in _reference_image_edges(moved, small, 7., fractional, fmt)
+      if edge[2][1] == 0
+    }
+    self.assertEqual(_image_edges(state, len(pos)), expected)
+
+  @parameterized.product(
+    fmt=(NeighborListFormat.Dense, NeighborListFormat.Sparse,
+         NeighborListFormat.OrderedSparse),
+    fractional=(False, True),
+  )
+  def test_combined_motion_deformation_threshold(self, fmt, fractional):
+    """The sum of atom motion and image deformation retains its >= boundary."""
+    box = np.diag(np.array([4., 5., 6.], np.float32))
+    pos = np.zeros((1, 3), np.float32)
+    fn = neighbor_list_multi_image(
+      None, box, 6., dr_threshold=1., format=fmt,
+      fractional_coordinates=fractional,
+    )
+    original = fn.allocate(pos, extra_capacity=64)
+    update = jax.jit(fn.update)
+    moved = pos.copy()
+    moved[0, 0] = .375 / 4 if fractional else .375
+    # The allocated image stencil reaches +/-2 in y, so max shift motion is
+    # exactly 2*shear. At .125 the combined bound is 2*.375 + 2*.125 == 1.
+    for shear in (.1249, .125, .1251):
+      cell = box.copy()
+      cell[0, 1] = shear
+      state = update(moved, original, box=cell)
+      self.assertFalse(bool(state.did_buffer_overflow))
+      if shear < .125:
+        np.testing.assert_array_equal(state.reference_position, pos)
+        np.testing.assert_array_equal(state.reference_box, box)
+      else:
+        np.testing.assert_array_equal(state.reference_position, moved)
+        np.testing.assert_array_equal(state.reference_box, cell)
+        self.assertEqual(
+          _image_edges(state, len(pos)),
+          _reference_image_edges(moved, cell, 7., fractional, fmt),
+        )
+      again = update(moved, state)
+      self.assertFalse(bool(again.did_buffer_overflow))
+      np.testing.assert_array_equal(again.reference_position, state.reference_position)
+      np.testing.assert_array_equal(again.reference_box, state.reference_box)
+      self.assertEqual(_image_edges(again, len(pos)), _image_edges(state, len(pos)))
 
   def test_empty_system(self):
     """Test behavior with a single atom (no neighbors)."""
