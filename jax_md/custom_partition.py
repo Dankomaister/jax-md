@@ -233,7 +233,9 @@ def _compute_distances_sq(
     Squared distances. Shape ``[num_shifts, N, N]``.
   """
   if fractional_coordinates:
-    position_real = position @ box.T  # [N, dim]
+    # Lattice products determine cutoff membership; reduced matmul precision
+    # can move triclinic pairs across the cutoff even with float32 inputs.
+    position_real = jnp.matmul(position, box.T, precision='highest')
   else:
     position_real = position
 
@@ -285,7 +287,9 @@ def _compute_pairwise_mask(
 
   # Convert to real coordinates if needed
   if fractional_coordinates:
-    position_real = position @ box.T  # [N, dim]
+    # Lattice products determine cutoff membership; reduced matmul precision
+    # can move triclinic pairs across the cutoff even with float32 inputs.
+    position_real = jnp.matmul(position, box.T, precision='highest')
   else:
     position_real = position
 
@@ -936,7 +940,7 @@ def neighbor_list_multi_image(
 
     @jax.jit
     def build_fn(pos, box, nl_shifts):
-      shifts_real = nl_shifts @ box.T
+      shifts_real = jnp.matmul(nl_shifts, box.T, precision='highest')
       zero_idx = jnp.argmin(jnp.sum(nl_shifts**2, axis=1))
       return build_nl_fn(
         pos,
@@ -971,8 +975,10 @@ def neighbor_list_multi_image(
   ) -> Array:  # scalar bool
     """Check if maximum displacement exceeds threshold."""
     if fractional_coordinates:
-      pos_new = position @ box.T  # [N, dim]
-      pos_old = reference_position @ reference_box.T
+      pos_new = jnp.matmul(position, box.T, precision='highest')
+      pos_old = jnp.matmul(
+        reference_position, reference_box.T, precision='highest'
+      )
     else:
       pos_new = position
       pos_old = reference_position
@@ -982,7 +988,9 @@ def neighbor_list_multi_image(
 
     # box deformation moves that periodic image by
     # shift @ (box - reference_box).T; this can dominate for large shifts
-    shift_delta = nl_shifts @ (box - reference_box).T
+    shift_delta = jnp.matmul(
+      nl_shifts, (box - reference_box).T, precision='highest'
+    )
     max_shift_disp = jnp.sqrt(jnp.max(jnp.sum(shift_delta**2, axis=-1)))
     # any pair displacement can change by at most the motion of both atoms plus
     # the deformation of its stored periodic image shift.

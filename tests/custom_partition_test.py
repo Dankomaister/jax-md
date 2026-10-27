@@ -1,5 +1,7 @@
 """Tests for custom_partition module comparing against ASE neighbor lists."""
 
+import itertools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -186,6 +188,53 @@ def get_mi_edges(
   return edges, nbrs, neighbor_fn, pos_frac
 
 
+
+def _reference_image_edges(position, box, cutoff, fractional, fmt):
+  """Independent float64 enumeration for wrapped small test systems."""
+  box = np.asarray(box, dtype=np.float64)
+  position = np.asarray(position, dtype=np.float64)
+  real = position @ box.T if fractional else position
+  extent = np.ceil(1 + cutoff * np.linalg.norm(np.linalg.inv(box), axis=1)).astype(int)
+  edges = set()
+  for shift in itertools.product(*(range(-n, n + 1) for n in extent)):
+    delta = real[None, :, :] + np.asarray(shift) @ box.T - real[:, None, :]
+    ii, jj = np.nonzero(np.sum(delta**2, axis=-1) < cutoff**2)
+    for i, j in zip(ii, jj):
+      if i == j and not any(shift):
+        continue
+      if fmt is NeighborListFormat.OrderedSparse:
+        if not any(shift):
+          if i >= j:
+            continue
+        elif next(x for x in shift if x) < 0:
+          continue
+      edges.add((int(i), int(j), tuple(shift)))
+  return edges
+
+
+def _image_edges(nbrs, n):
+  """Read valid edges, checking padding and duplicate semantics."""
+  shifts = np.asarray(nbrs.shifts)
+  if nbrs.format is NeighborListFormat.Dense:
+    idx = np.asarray(nbrs.idx)
+    assert np.all((idx >= 0) & (idx <= n))
+    i, k = np.nonzero(idx < n)
+    j = idx[i, k]
+    assert np.all(shifts[idx == n] == 0)
+    selected = shifts[i, k]
+  else:
+    idx = np.asarray(nbrs.idx)
+    assert np.all((idx >= 0) & (idx <= n))
+    valid = idx[0] < n
+    np.testing.assert_array_equal(valid, idx[1] < n)
+    assert np.all(shifts[~valid] == 0)
+    i, j = idx[:, valid]
+    selected = shifts[valid]
+  keys = [(int(a), int(b), tuple(map(int, s))) for a, b, s in zip(i, j, selected)]
+  assert len(keys) == len(set(keys))
+  return set(keys)
+
+
 class CustomPartitionTest(parameterized.TestCase):
   """Test multi-image neighbor list against ASE."""
 
@@ -307,6 +356,33 @@ class CustomPartitionTest(parameterized.TestCase):
     edges_mi, nbrs, _, _ = get_mi_edges(atoms, cutoff)
 
     self.assertEqual(edges_ase, edges_mi, 'Edge sets do not match ASE')
+
+
+  @parameterized.product(
+    fmt=(NeighborListFormat.Dense, NeighborListFormat.Sparse, NeighborListFormat.OrderedSparse),
+    fractional=(False, True),
+    cutoff=(3.5, 3.5002, 3.5015),
+  )
+  def test_near_cutoff_triclinic_float32(self, fmt, fractional, cutoff):
+    """Lattice products must not admit edges outside a sharp cutoff."""
+    atoms = Atoms(**CaCrP2O7_mvc_11955)
+    box = np.asarray(atoms.cell.T, dtype=np.float32)
+    position = np.asarray(
+      atoms.get_scaled_positions() if fractional else atoms.positions,
+      dtype=np.float32,
+    )
+    # Exercise reduced caller precision; the geometry must request its own
+    # float32 product accuracy without changing the caller's global policy.
+    with jax.default_matmul_precision('default'):
+      fn = neighbor_list_multi_image(
+        None, box, cutoff, fractional_coordinates=fractional, format=fmt
+      )
+      nbrs = fn.allocate(position)
+      updated = jax.jit(fn.update)(position, nbrs)
+    expected = _reference_image_edges(position, box, cutoff, fractional, fmt)
+    self.assertFalse(bool(updated.did_buffer_overflow))
+    self.assertEqual(_image_edges(nbrs, len(position)), expected)
+    self.assertEqual(_image_edges(updated, len(position)), expected)
 
   def test_edges_match_ase_triclinic(self):
     """Verify edges match ASE for triclinic cell."""
